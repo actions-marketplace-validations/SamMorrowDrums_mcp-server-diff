@@ -48227,6 +48227,9 @@ class Protocol {
      * The Protocol object assumes ownership of the Transport, replacing any callbacks that have already been set, and expects that it is the only user of the Transport instance going forward.
      */
     async connect(transport) {
+        if (this._transport) {
+            throw new Error('Already connected to a transport. Call close() before connecting to a new transport, or use a separate Protocol instance per connection.');
+        }
         this._transport = transport;
         const _onclose = this.transport?.onclose;
         this._transport.onclose = () => {
@@ -48262,6 +48265,11 @@ class Protocol {
         this._progressHandlers.clear();
         this._taskProgressTokens.clear();
         this._pendingDebouncedNotifications.clear();
+        // Abort all in-flight request handlers so they stop sending messages
+        for (const controller of this._requestHandlerAbortControllers.values()) {
+            controller.abort();
+        }
+        this._requestHandlerAbortControllers.clear();
         const error = McpError.fromError(ErrorCode.ConnectionClosed, 'Connection closed');
         this._transport = undefined;
         this.onclose?.();
@@ -48322,6 +48330,8 @@ class Protocol {
             sessionId: capturedTransport?.sessionId,
             _meta: request.params?._meta,
             sendNotification: async (notification) => {
+                if (abortController.signal.aborted)
+                    return;
                 // Include related-task metadata if this request is part of a task
                 const notificationOptions = { relatedRequestId: request.id };
                 if (relatedTaskId) {
@@ -48330,6 +48340,9 @@ class Protocol {
                 await this.notification(notification, notificationOptions);
             },
             sendRequest: async (r, resultSchema, options) => {
+                if (abortController.signal.aborted) {
+                    throw new McpError(ErrorCode.ConnectionClosed, 'Request was cancelled');
+                }
                 // Include related-task metadata if this request is part of a task
                 const requestOptions = { ...options, relatedRequestId: request.id };
                 if (relatedTaskId && !requestOptions.relatedTask) {
@@ -49704,8 +49717,10 @@ class Client extends Protocol {
                     }
                     return taskValidationResult.data;
                 }
-                // For non-task requests, validate against CreateMessageResultSchema
-                const validationResult = zod_compat_safeParse(CreateMessageResultSchema, result);
+                // For non-task requests, validate against appropriate schema based on tools presence
+                const hasTools = params.tools || params.toolChoice;
+                const resultSchema = hasTools ? CreateMessageResultWithToolsSchema : CreateMessageResultSchema;
+                const validationResult = zod_compat_safeParse(resultSchema, result);
                 if (!validationResult.success) {
                     const errorMessage = validationResult.error instanceof Error ? validationResult.error.message : String(validationResult.error);
                     throw new McpError(ErrorCode.InvalidParams, `Invalid sampling result: ${errorMessage}`);
@@ -57733,16 +57748,48 @@ function generateMarkdownReport(report) {
     lines.push(`| Branch Total Time | ${formatTime(report.totalBranchTime)} |`);
     lines.push(`| Base Total Time | ${formatTime(report.totalBaseTime)} |`);
     lines.push("");
-    // Overall status
+    // Overall status with passing and failing configurations
     if (report.diffCount === 0) {
         lines.push("## ✅ No API Changes");
         lines.push("");
-        lines.push("No differences detected between the current branch and the comparison ref.");
+        lines.push("All configurations passed with no differences detected.");
+        lines.push("");
+        lines.push("**✅ Passing configurations (no changes detected):**");
+        for (const result of report.results) {
+            if (!result.error && !result.diffs.has("error") && !result.hasDifferences) {
+                lines.push(`- ${result.configName}`);
+            }
+        }
     }
     else {
         lines.push("## 📋 API Changes Detected");
         lines.push("");
-        lines.push(`${report.diffCount} configuration(s) have changes. Review below to ensure they are intentional.`);
+        // List passing configurations first
+        const passingConfigs = report.results.filter((r) => !r.error && !r.diffs.has("error") && !r.hasDifferences);
+        if (passingConfigs.length > 0) {
+            lines.push("**✅ Passing configurations (no changes detected):**");
+            for (const result of passingConfigs) {
+                lines.push(`- ${result.configName}`);
+            }
+            lines.push("");
+        }
+        // List configurations with changes (excluding errors)
+        const changedConfigs = report.results.filter((r) => r.hasDifferences && !r.error && !r.diffs.has("error"));
+        if (changedConfigs.length > 0) {
+            lines.push("**⚠️ Configurations with changes:**");
+            for (const result of changedConfigs) {
+                lines.push(`- ${result.configName} (see diff below)`);
+            }
+            lines.push("");
+        }
+        // List configurations with errors if any
+        const errorConfigs = report.results.filter((r) => r.error || r.diffs.has("error"));
+        if (errorConfigs.length > 0) {
+            lines.push("**❌ Configurations with errors:**");
+            for (const result of errorConfigs) {
+                lines.push(`- ${result.configName}`);
+            }
+        }
     }
     lines.push("");
     // Per-configuration results
@@ -57851,18 +57898,44 @@ function generatePRSummary(report) {
         lines.push("## ✅ MCP Conformance: No Changes");
         lines.push("");
         lines.push(`Tested ${report.results.length} configuration(s) - no API changes detected.`);
+        lines.push("");
+        lines.push("**✅ Passing configurations:**");
+        for (const result of report.results.filter((r) => !r.error && !r.diffs.has("error") && !r.hasDifferences)) {
+            lines.push(`- ${result.configName}`);
+        }
     }
     else {
         lines.push("## 📋 MCP Conformance: API Changes Detected");
         lines.push("");
         lines.push(`**${report.diffCount}** of ${report.results.length} configuration(s) have changes.`);
         lines.push("");
-        lines.push("### Changed Endpoints");
-        lines.push("");
-        for (const result of report.results.filter((r) => r.hasDifferences)) {
-            lines.push(`- **${result.configName}:** ${Array.from(result.diffs.keys()).join(", ")}`);
+        // List passing configurations
+        const passingConfigs = report.results.filter((r) => !r.error && !r.diffs.has("error") && !r.hasDifferences);
+        if (passingConfigs.length > 0) {
+            lines.push("**✅ Passing configurations (no changes):**");
+            for (const result of passingConfigs) {
+                lines.push(`- ${result.configName}`);
+            }
+            lines.push("");
         }
-        lines.push("");
+        // List configurations with changes (excluding errors)
+        const changedConfigs = report.results.filter((r) => r.hasDifferences && !r.error && !r.diffs.has("error"));
+        if (changedConfigs.length > 0) {
+            lines.push("**⚠️ Changed configurations:**");
+            for (const result of changedConfigs) {
+                lines.push(`- **${result.configName}:** ${Array.from(result.diffs.keys()).join(", ")}`);
+            }
+            lines.push("");
+        }
+        // List configurations with errors if any
+        const errorConfigs = report.results.filter((r) => r.error || r.diffs.has("error"));
+        if (errorConfigs.length > 0) {
+            lines.push("**❌ Configurations with errors:**");
+            for (const result of errorConfigs) {
+                lines.push(`- ${result.configName}`);
+            }
+            lines.push("");
+        }
         lines.push("See the full report in the job summary for details.");
     }
     return lines.join("\n");

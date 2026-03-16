@@ -57,17 +57,54 @@ export function generateMarkdownReport(report: ConformanceReport): string {
   lines.push(`| Base Total Time | ${formatTime(report.totalBaseTime)} |`);
   lines.push("");
 
-  // Overall status
+  // Overall status with passing and failing configurations
   if (report.diffCount === 0) {
     lines.push("## ✅ No API Changes");
     lines.push("");
-    lines.push("No differences detected between the current branch and the comparison ref.");
+    lines.push("All configurations passed with no differences detected.");
+    lines.push("");
+    lines.push("**✅ Passing configurations (no changes detected):**");
+    for (const result of report.results) {
+      if (!result.error && !result.diffs.has("error") && !result.hasDifferences) {
+        lines.push(`- ${result.configName}`);
+      }
+    }
   } else {
     lines.push("## 📋 API Changes Detected");
     lines.push("");
-    lines.push(
-      `${report.diffCount} configuration(s) have changes. Review below to ensure they are intentional.`
+
+    // List passing configurations first
+    const passingConfigs = report.results.filter(
+      (r) => !r.error && !r.diffs.has("error") && !r.hasDifferences
     );
+    if (passingConfigs.length > 0) {
+      lines.push("**✅ Passing configurations (no changes detected):**");
+      for (const result of passingConfigs) {
+        lines.push(`- ${result.configName}`);
+      }
+      lines.push("");
+    }
+
+    // List configurations with changes (excluding errors)
+    const changedConfigs = report.results.filter(
+      (r) => r.hasDifferences && !r.error && !r.diffs.has("error")
+    );
+    if (changedConfigs.length > 0) {
+      lines.push("**⚠️ Configurations with changes:**");
+      for (const result of changedConfigs) {
+        lines.push(`- ${result.configName} (see diff below)`);
+      }
+      lines.push("");
+    }
+
+    // List configurations with errors if any
+    const errorConfigs = report.results.filter((r) => r.error || r.diffs.has("error"));
+    if (errorConfigs.length > 0) {
+      lines.push("**❌ Configurations with errors:**");
+      for (const result of errorConfigs) {
+        lines.push(`- ${result.configName}`);
+      }
+    }
   }
   lines.push("");
 
@@ -194,6 +231,13 @@ export function generatePRSummary(report: ConformanceReport): string {
     lines.push("## ✅ MCP Conformance: No Changes");
     lines.push("");
     lines.push(`Tested ${report.results.length} configuration(s) - no API changes detected.`);
+    lines.push("");
+    lines.push("**✅ Passing configurations:**");
+    for (const result of report.results.filter(
+      (r) => !r.error && !r.diffs.has("error") && !r.hasDifferences
+    )) {
+      lines.push(`- ${result.configName}`);
+    }
   } else {
     lines.push("## 📋 MCP Conformance: API Changes Detected");
     lines.push("");
@@ -201,14 +245,41 @@ export function generatePRSummary(report: ConformanceReport): string {
       `**${report.diffCount}** of ${report.results.length} configuration(s) have changes.`
     );
     lines.push("");
-    lines.push("### Changed Endpoints");
-    lines.push("");
 
-    for (const result of report.results.filter((r) => r.hasDifferences)) {
-      lines.push(`- **${result.configName}:** ${Array.from(result.diffs.keys()).join(", ")}`);
+    // List passing configurations
+    const passingConfigs = report.results.filter(
+      (r) => !r.error && !r.diffs.has("error") && !r.hasDifferences
+    );
+    if (passingConfigs.length > 0) {
+      lines.push("**✅ Passing configurations (no changes):**");
+      for (const result of passingConfigs) {
+        lines.push(`- ${result.configName}`);
+      }
+      lines.push("");
     }
 
-    lines.push("");
+    // List configurations with changes (excluding errors)
+    const changedConfigs = report.results.filter(
+      (r) => r.hasDifferences && !r.error && !r.diffs.has("error")
+    );
+    if (changedConfigs.length > 0) {
+      lines.push("**⚠️ Changed configurations:**");
+      for (const result of changedConfigs) {
+        lines.push(`- **${result.configName}:** ${Array.from(result.diffs.keys()).join(", ")}`);
+      }
+      lines.push("");
+    }
+
+    // List configurations with errors if any
+    const errorConfigs = report.results.filter((r) => r.error || r.diffs.has("error"));
+    if (errorConfigs.length > 0) {
+      lines.push("**❌ Configurations with errors:**");
+      for (const result of errorConfigs) {
+        lines.push(`- ${result.configName}`);
+      }
+      lines.push("");
+    }
+
     lines.push("See the full report in the job summary for details.");
   }
 
